@@ -13,3 +13,16 @@ seaborn>=0.12.2
 sqlalchemy>=2.0.38
 sympy>=1.10.1
 xgboost
+statsmodels
+tqdm
+pmdarima
+joblib
+pandas
+numpy
+matplotlib
+scikit-learn
+statsmodels
+joblib
+python-dotenv
+sqlalchemy
+
