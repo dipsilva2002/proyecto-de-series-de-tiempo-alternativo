@@ -1,308 +1,161 @@
-import os
-import argparse
-import json as jsonlib
-import warnings
-from typing import Tuple, Dict, List
-warnings.filterwarnings("ignore")
-
+from __future__ import annotations
+import os, json, argparse
+from typing import Dict
 import numpy as np
 import pandas as pd
-
+from tqdm import tqdm
 import matplotlib.pyplot as plt
-import seaborn as sns
+from sklearn.ensemble import RandomForestRegressor
+from dotenv import load_dotenv
 
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.preprocessing import StandardScaler
-from sklearn.base import BaseEstimator
+from src.utils import (
+    ensure_dirs, load_water_csv, build_supervised_frame, evaluate_forecast,
+    seasonal_naive_forecast, PROCESSED_DIR, RAW_DIR, FIG_DIR
+)
 
-try:
-    from xgboost import XGBRegressor
-    _HAS_XGB = True
-except Exception:
-    _HAS_XGB = False
+def list_raw_files():
+    files = [f for f in os.listdir(RAW_DIR) if f.endswith('.csv')]
+    if not files:
+        print(f"No hay CSVs en {RAW_DIR}. Ejecuta primero: python -m src.prepare_kaggle --dest data/raw")
+    else:
+        print("CSV encontrados en data/raw:\n - " + "\n - ".join(files))
 
-from statsmodels.tsa.statespace.sarimax import SARIMAX
+def plot_zone(df_zone: pd.DataFrame, zone: str):
+    plt.figure(figsize=(10,4))
+    plt.plot(df_zone['date'], df_zone['volume'])
+    plt.title(f"Zona: {zone}")
+    plt.xlabel("Fecha"); plt.ylabel("Volumen")
+    out = os.path.join(FIG_DIR, f"{zone}_series.png")
+    plt.tight_layout(); plt.savefig(out); plt.close()
+    print(f"Figura guardada: {out}")
 
-from src.utils import Paths, ensure_dirs, get_env_int, get_env_str
+def train_rf_for_zone(zone_df: pd.DataFrame, horizon: int, random_state: int = 42) -> Dict[str, float]:
+    Xdf = build_supervised_frame(zone_df)
+    n = len(Xdf)
+    if n < 50:
+        return {"error": "Muy pocas filas para entrenar"}
+    split = int(n * 0.8)
+    train, test = Xdf.iloc[:split], Xdf.iloc[split:]
+    feats = [c for c in Xdf.columns if c not in ("date","zone","volume")]
+    model = RandomForestRegressor(n_estimators=400, random_state=random_state, n_jobs=-1)
+    model.fit(train[feats], train["volume"])
+    y_pred = model.predict(test[feats])
+    metrics = evaluate_forecast(test["volume"].values, y_pred)
 
+    last_known = Xdf.iloc[-1:].copy()
+    future_rows = []
+    current_date = last_known["date"].iloc[0]
+    last_zone = last_known["zone"].iloc[0]
+    history = Xdf[["date","volume"]].copy().reset_index(drop=True)
 
-class MeanDummyRegressor(BaseEstimator):
-    def __init__(self, mean_value: float):
-        self.mean_value = float(mean_value)
+    for _ in range(horizon):
+        current_date = current_date + pd.Timedelta(days=1)
+        tmp = pd.DataFrame({"date": [current_date], "zone": [last_zone]})
+        tmp_full = pd.concat([history.assign(zone=last_zone), tmp.assign(volume=np.nan)], ignore_index=True)
+        tmp_full["date"] = pd.to_datetime(tmp_full["date"])
+        tmp_feats = tmp_full.copy()
+        tmp_feats["dow"] = tmp_feats["date"].dt.dayofweek
+        tmp_feats["month"] = tmp_feats["date"].dt.month
+        tmp_feats["day"] = tmp_feats["date"].dt.day
+        for L in (1,7,14,28):
+            tmp_feats[f"lag_{L}"] = tmp_feats["volume"].shift(L)
+        for w in (7,28):
+            tmp_feats[f"rollmean_{w}"] = tmp_feats["volume"].shift(1).rolling(w).mean()
+            tmp_feats[f"rollstd_{w}"]  = tmp_feats["volume"].shift(1).rolling(w).std()
+        row = tmp_feats.iloc[[-1]].drop(columns=["volume"]).copy()
+        row = row.drop(columns=[c for c in ("date","zone") if c in row.columns], errors="ignore")
+        if row.isna().any().any():
+            yhat = seasonal_naive_forecast(history["volume"], 1, season_length=7)[0]
+        else:
+            yhat = float(model.predict(row)[0])
+        history = pd.concat([history, pd.DataFrame({"date":[current_date], "volume":[yhat]})], ignore_index=True)
+        future_rows.append({"date": current_date, "zone": last_zone, "prediction": yhat})
+    return {**metrics, "model": "RandomForest", "horizon": horizon, "forecast": future_rows}
 
-    def predict(self, X):
-        import numpy as np
-        return np.repeat(self.mean_value, len(X))
+def train_baseline_for_zone(zone_df: pd.DataFrame, horizon: int, season_length: int = 7) -> Dict[str, float]:
+    n = len(zone_df)
+    split = int(n*0.8)
+    train = zone_df.iloc[:split]
+    test  = zone_df.iloc[split:]
+    preds = []
+    window = train["volume"].copy()
+    i = 0
+    while i < len(test):
+        step = min(season_length, len(test)-i)
+        yhat = seasonal_naive_forecast(window, step, season_length=season_length)
+        preds.extend(yhat)
+        window = pd.concat([window, test["volume"].iloc[i:i+step]], ignore_index=True)
+        i += step
+    metrics = evaluate_forecast(test["volume"].values, preds)
+    future = seasonal_naive_forecast(zone_df["volume"], horizon, season_length=season_length)
+    future_rows = []
+    last_date = zone_df["date"].iloc[-1]
+    last_zone = zone_df["zone"].iloc[-1]
+    for h, yhat in enumerate(future, start=1):
+        future_rows.append({"date": last_date + pd.Timedelta(days=h), "zone": last_zone, "prediction": float(yhat)})
+    return {**metrics, "model": f"SeasonalNaive(s={season_length})", "horizon": horizon, "forecast": future_rows}
 
+def cmd_build_dataset(args):
+    import runpy
+    runpy.run_path(os.path.join("src","build_dataset.py"))
 
-def generate_synthetic_multizone(start="2020-01-01", periods=1000, freq="D", seed=42) -> pd.DataFrame:
-    rng = np.random.default_rng(seed)
-    idx = pd.date_range(start=start, periods=periods, freq=freq)
-    zones = ["A", "B", "C"]
-    rows = []
+def cmd_explore(args):
+    df = load_water_csv()
+    zones = sorted(df['zone'].unique())
+    print(f"Zonas detectadas: {len(zones)}")
     for z in zones:
-        baseline = {"A": 120, "B": 200, "C": 80}[z]
-        seasonal = 20 * np.sin(2 * np.pi * np.arange(periods) / 7.0)
-        trend = np.linspace(0, 10, periods)
-        noise = rng.normal(0, 8, periods)
-        volume = baseline + seasonal + trend + noise
-        rows.append(pd.DataFrame({"date": idx, "zone": z, "volume": volume}))
-    df = pd.concat(rows, ignore_index=True)
-    return df
+        zdf = df[df['zone']==z].copy()
+        plot_zone(zdf, z)
 
-
-def load_or_create_raw(p: Paths, seed: int = 42) -> pd.DataFrame:
-    ensure_dirs(p)
-    raw_csv = os.path.join(p.raw_dir, "water.csv")
-    if os.path.exists(raw_csv):
-        df = pd.read_csv(raw_csv, parse_dates=["date"])
-    else:
-        df = generate_synthetic_multizone(seed=seed)
-        df.to_csv(raw_csv, index=False)
-    df = df.dropna().copy()
-    df["zone"] = df["zone"].astype(str)
-    df = df.sort_values(["zone", "date"])
-    return df
-
-
-def plot_overview(df: pd.DataFrame, p: Paths):
-    fig, ax = plt.subplots(1, 1, figsize=(10, 4))
-    for z, g in df.groupby("zone"):
-        ax.plot(g["date"], g["volume"], label=f"Zone {z}", alpha=0.8)
-    ax.set_title("Volumen de agua por zona (serie temporal)")
-    ax.set_xlabel("Fecha")
-    ax.set_ylabel("Volumen")
-    ax.legend()
-    plt.tight_layout()
-    fig_path = os.path.join(p.reports_dir, "overview.png")
-    plt.savefig(fig_path)
-    plt.close(fig)
-
-
-def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["dayofweek"] = df["date"].dt.dayofweek
-    df["month"] = df["date"].dt.month
-    df["dayofyear"] = df["date"].dt.dayofyear
-    return df
-
-
-def make_lag_features(df: pd.DataFrame, lags: List[int] = [1, 7, 14]) -> pd.DataFrame:
-    df = df.copy().sort_values(["zone", "date"])
-    for L in lags:
-        df[f"lag_{L}"] = df.groupby("zone")["volume"].shift(L)
-    df["roll7"] = df.groupby("zone")["volume"].rolling(7, min_periods=1).mean().reset_index(0, drop=True)
-    df["roll14"] = df.groupby("zone")["volume"].rolling(14, min_periods=1).mean().reset_index(0, drop=True)
-    return df
-
-
-def prepare_processed(df_raw: pd.DataFrame, p: Paths) -> pd.DataFrame:
-    df = add_time_features(df_raw)
-    df = make_lag_features(df)
-    df = df.dropna().reset_index(drop=True)
-    out_csv = os.path.join(p.processed_dir, "processed.csv")
-    df.to_csv(out_csv, index=False)
-    return df
-
-
-def seasonal_naive_forecast(zone_series: pd.Series, horizon: int, season: int = 7) -> np.ndarray:
-    history = zone_series.values
-    if len(history) < season:
-        return np.repeat(history[-1], horizon)
-    last_season = history[-season:]
-    reps = int(np.ceil(horizon / season))
-    fcst = np.tile(last_season, reps)[:horizon]
-    return fcst
-
-
-def train_sarimax_per_zone(df: pd.DataFrame, order=(1,0,1), seasonal_order=(1,0,1,7)) -> Dict[str, object]:
-    models = {}
-    for z, g in df.groupby("zone"):
-        g = g.sort_values("date")
-        endog = g["volume"].values
-        model = SARIMAX(endog, order=order, seasonal_order=seasonal_order, enforce_stationarity=False, enforce_invertibility=False)
-        fit = model.fit(disp=False)
-        models[z] = fit
-    return models
-
-
-def train_xgb_global(df_proc: pd.DataFrame):
-    df = pd.get_dummies(df_proc.copy(), columns=["zone"], drop_first=False)
-    feature_cols = [c for c in df.columns if c not in ["date", "volume"]]
-    if not _HAS_XGB:
-        print("XGBoost no disponible. Usando MeanDummyRegressor (media global).")
-        dummy = MeanDummyRegressor(mean_value=df["volume"].mean())
-        return dummy, feature_cols
-    X = df[feature_cols]
-    y = df["volume"]
-    model = XGBRegressor(
-        n_estimators=600, max_depth=6, learning_rate=0.05,
-        subsample=0.9, colsample_bytree=0.9, random_state=42, n_jobs=-1
-    )
-    model.fit(X, y)
-    return model, feature_cols
-
-
-def metrics(y_true, y_pred) -> Dict[str, float]:
-    mae = float(mean_absolute_error(y_true, y_pred))
-    mse = float(mean_squared_error(y_true, y_pred))  # sin 'squared=' para compatibilidad
-    rmse = float(np.sqrt(mse))
-    mape = float(np.mean(np.abs((y_true - y_pred) / np.clip(np.abs(y_true), 1e-8, None))) * 100.0)
-    return {"mae": mae, "rmse": rmse, "mape": mape}
-
-
-def evaluate_models(df_raw: pd.DataFrame, df_proc: pd.DataFrame, saris: Dict[str, object], xgb: object, xgb_cols: List[str], horizon: int = 30, p: Paths = Paths()) -> Dict:
-    results = {}
-    for z, g in df_raw.groupby("zone"):
-        g = g.sort_values("date")
-        train = g.iloc[:-horizon]
-        test = g.iloc[-horizon:]
-        sn_pred = seasonal_naive_forecast(train["volume"], horizon=horizon, season=7)
-        sn_metrics = metrics(test["volume"].values, sn_pred)
-        sar = saris[z]
-        sar_pred = sar.forecast(steps=horizon)
-        sar_metrics = metrics(test["volume"].values, sar_pred)
-        g_proc = df_proc[df_proc["zone"] == z].sort_values("date")
-        X_test = g_proc.iloc[-horizon:].copy()
-        X_test = pd.get_dummies(X_test, columns=["zone"], drop_first=False)
-        for c in xgb_cols:
-            if c not in X_test.columns:
-                X_test[c] = 0
-        X_test = X_test[xgb_cols]
-        xgb_pred = xgb.predict(X_test)
-        xgb_metrics = metrics(test["volume"].values, xgb_pred)
-        results[z] = {
-            "seasonal_naive": sn_metrics,
-            "sarimax": sar_metrics,
-            "xgb": xgb_metrics
-        }
-    return results
-
-
-def forecast(df_raw: pd.DataFrame, df_proc: pd.DataFrame, saris: Dict[str, object], xgb: object, xgb_cols: List[str], horizon: int, p: Paths) -> pd.DataFrame:
-    last_date = df_raw["date"].max()
-    future_idx = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=horizon, freq="D")
-    out_rows = []
-    for z in sorted(df_raw["zone"].unique()):
-        g = df_raw[df_raw["zone"] == z].sort_values("date")
-        sn_pred = seasonal_naive_forecast(g["volume"], horizon=horizon, season=7)
-        sar = saris[z]
-        sar_pred = sar.forecast(steps=horizon)
-        g_proc = df_proc[df_proc["zone"] == z].sort_values("date")
-        last = g_proc.iloc[-1:].copy()
-        future_feats = []
-        for dt in future_idx:
-            row = last.copy()
-            row["date"] = dt
-            row["dayofweek"] = dt.dayofweek
-            row["month"] = dt.month
-            row["dayofyear"] = dt.timetuple().tm_yday
-            future_feats.append(row)
-        fut_df = pd.concat(future_feats, ignore_index=True)
-        fut_df = pd.get_dummies(fut_df, columns=["zone"], drop_first=False)
-        for c in xgb_cols:
-            if c not in fut_df.columns:
-                fut_df[c] = 0
-        fut_df = fut_df[xgb_cols]
-        xgb_pred = xgb.predict(fut_df)
-        out_rows.append(pd.DataFrame({
-            "date": future_idx,
-            "zone": z,
-            "pred_seasonal_naive": sn_pred,
-            "pred_sarimax": sar_pred,
-            "pred_xgb": xgb_pred
-        }))
-    fcst = pd.concat(out_rows, ignore_index=True)
-    fcst.to_csv(os.path.join(p.processed_dir, "forecast.csv"), index=False)
-    return fcst
-
-
-def save_models(saris: Dict[str, object], xgb: object, p: Paths):
-    import joblib
-    for z, model in saris.items():
-        joblib.dump(model, os.path.join(p.models_dir, f"sarimax_zone_{z}.joblib"))
-    if isinstance(xgb, MeanDummyRegressor):
-        print("XGB es dummy; no se guarda artefacto xgb_global.joblib.")
-    else:
-        joblib.dump(xgb, os.path.join(p.models_dir, "xgb_global.joblib"))
-
-
-def save_metrics(metrics_dict: Dict, p: Paths):
-    with open(os.path.join(p.models_dir, "metrics.json"), "w") as f:
-        jsonlib.dump(metrics_dict, f, indent=2)
-
-
-def plot_forecast(fcst: pd.DataFrame, df_raw: pd.DataFrame, p: Paths):
-    for z in sorted(df_raw["zone"].unique()):
-        hist = df_raw[df_raw["zone"] == z].sort_values("date")
-        fut = fcst[fcst["zone"] == z].sort_values("date")
-        fig, ax = plt.subplots(figsize=(10, 4))
-        ax.plot(hist["date"], hist["volume"], label="Histórico")
-        ax.plot(fut["date"], fut["pred_seasonal_naive"], "--", label="SN")
-        ax.plot(fut["date"], fut["pred_sarimax"], "--", label="SARIMAX")
-        ax.plot(fut["date"], fut["pred_xgb"], "--", label="XGB")
-        ax.set_title(f"Zona {z} - Forecast")
-        ax.legend()
-        plt.tight_layout()
-        plt.savefig(os.path.join(p.reports_dir, f"forecast_zone_{z}.png"))
-        plt.close(fig)
-
+def cmd_train(args):
+    df = load_water_csv()
+    zones_target = sorted(df['zone'].unique()) if args.zones == 'all' else [z.strip() for z in args.zones.split(',')]
+    all_forecasts = []
+    metrics_out = {}
+    for z in tqdm(zones_target, desc="Entrenando por zona"):
+        zdf = df[df['zone']==z].copy().sort_values('date')
+        if len(zdf) < 60:
+            print(f"Saltando zona {z} (muy pocos datos)")
+            continue
+        if args.model == 'baseline':
+            res = train_baseline_for_zone(zdf, horizon=args.horizon, season_length=args.season)
+        else:
+            res = train_rf_for_zone(zdf, horizon=args.horizon)
+        metrics_out[z] = {k:v for k,v in res.items() if k not in ("forecast",)}
+        all_forecasts.extend(res.get("forecast", []))
+    os.makedirs(PROCESSED_DIR, exist_ok=True)
+    with open(os.path.join(PROCESSED_DIR, "metrics.json"), "w") as f:
+        json.dump(metrics_out, f, indent=2)
+    print(f"Métricas guardadas en {os.path.join(PROCESSED_DIR, 'metrics.json')}")
+    if all_forecasts:
+        fdf = pd.DataFrame(all_forecasts)
+        fdf = fdf.sort_values(["zone","date"]).reset_index(drop=True)
+        out_csv = os.path.join(PROCESSED_DIR, "forecasts.csv")
+        fdf.to_csv(out_csv, index=False)
+        print(f"Pronósticos guardados en {out_csv}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Proyecto de Series Temporales: Volumen de agua por zonas")
-    parser.add_argument("--prepare", action="store_true", help="Crea/limpia datos y features")
-    parser.add_argument("--train", action="store_true", help="Entrena modelos")
-    parser.add_argument("--evaluate", action="store_true", help="Evalúa modelos")
-    parser.add_argument("--forecast", action="store_true", help="Genera pronóstico")
-    parser.add_argument("--horizon", type=int, default=None, help="Horizonte de forecast")
-    parser.add_argument("--all", action="store_true", help="Ejecuta prepare+train+evaluate+forecast")
+    load_dotenv()
+    ensure_dirs()
+    parser = argparse.ArgumentParser(description="Proyecto Tutorial de Series Temporales - Acea Water Prediction")
+    sub = parser.add_subparsers(dest='command')
+
+    sub.add_parser('list', help='Lista CSVs en data/raw').set_defaults(func=lambda args: list_raw_files())
+    sub.add_parser('build-dataset', help='Combina CSVs en data/raw a data/raw/water.csv').set_defaults(func=cmd_build_dataset)
+    sub.add_parser('explore', help='EDA básica (figuras por zona)').set_defaults(func=cmd_explore)
+
+    tr = sub.add_parser('train', help='Entrena y pronostica por zona')
+    tr.add_argument('--model', default='rf', choices=['rf','baseline'])
+    tr.add_argument('--horizon', type=int, default=30)
+    tr.add_argument('--season', type=int, default=7, help='Solo para baseline')
+    tr.add_argument('--zones', default='all', help='"all" o lista separada por coma: Z1,Z2')
+    tr.set_defaults(func=cmd_train)
+
     args = parser.parse_args()
+    if not hasattr(args, 'func'):
+        parser.print_help()
+        return
+    args.func(args)
 
-    seed = get_env_int("SEED", 42)
-    default_h = get_env_int("FORECAST_HORIZON", 30)
-    horizon = args.horizon if args.horizon is not None else default_h
-
-    p = Paths()
-    ensure_dirs(p)
-
-    if args.prepare or args.all:
-        df_raw = load_or_create_raw(p, seed=seed)
-        plot_overview(df_raw, p)
-        df_proc = prepare_processed(df_raw, p)
-        print("PREPARE listo: data/raw/water.csv, data/processed/processed.csv y reports/figures/overview.png")
-
-    if not (args.prepare or args.all):
-        df_raw = pd.read_csv(os.path.join(p.raw_dir, "water.csv"), parse_dates=["date"])
-        df_proc = pd.read_csv(os.path.join(p.processed_dir, "processed.csv"), parse_dates=["date"])
-
-    if args.train or args.all:
-        saris = train_sarimax_per_zone(df_raw)
-        xgb, xgb_cols = train_xgb_global(df_proc)
-        save_models(saris, xgb, p)
-        with open(os.path.join(p.models_dir, "xgb_columns.json"), "w") as f:
-            jsonlib.dump(xgb_cols, f)
-        print("modelos guardados en /models")
-
-    if not (args.train or args.all):
-        import joblib
-        saris = {}
-        for z in sorted(df_raw["zone"].unique()):
-            saris[z] = joblib.load(os.path.join(p.models_dir, f"sarimax_zone_{z}.joblib"))
-        with open(os.path.join(p.models_dir, "xgb_columns.json")) as f:
-            xgb_cols = jsonlib.load(f)
-        xgb = joblib.load(os.path.join(p.models_dir, "xgb_global.joblib"))
-
-    if args.evaluate or args.all:
-        res = evaluate_models(df_raw, df_proc, saris, xgb, xgb_cols, horizon=horizon, p=p)
-        save_metrics(res, p)
-        print("EVALUATE listo: métricas en models/metrics.json")
-
-    if args.forecast or args.all:
-        fcst = forecast(df_raw, df_proc, saris, xgb, xgb_cols, horizon=horizon, p=p)
-        plot_forecast(fcst, df_raw, p)
-        print(f"FORECAST listo: forecast.csv y figuras por zona en {p.reports_dir}")
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

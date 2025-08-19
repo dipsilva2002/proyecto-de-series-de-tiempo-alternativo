@@ -1,0 +1,65 @@
+{
+  "Aquifer_Auser": {
+    "MAE": 0.20159664879356534,
+    "RMSE": 0.8999943578632358,
+    "MAPE": 1.0865478747003432,
+    "model": "RandomForest",
+    "horizon": 30
+  },
+  "Aquifer_Doganella": {
+    "MAE": 4.06497039473685,
+    "RMSE": 4.916446706264218,
+    "MAPE": 9.34628834027616,
+    "model": "RandomForest",
+    "horizon": 30
+  },
+  "Aquifer_Luco": {
+    "MAE": 0.30599517374518487,
+    "RMSE": 0.44012459872572895,
+    "MAPE": 3.942641151778989,
+    "model": "RandomForest",
+    "horizon": 30
+  },
+  "Aquifer_Petrignano": {
+    "MAE": 0.11236699902723862,
+    "RMSE": 0.14766012338660084,
+    "MAPE": 0.43066664758014694,
+    "model": "RandomForest",
+    "horizon": 30
+  },
+  "Lake_Bilancino": {
+    "MAE": 2.1877002923976607,
+    "RMSE": 3.6854671380158486,
+    "MAPE": 172.2819147933548,
+    "model": "RandomForest",
+    "horizon": 30
+  },
+  "River_Arno": {
+    "MAE": 6.279574468085108,
+    "RMSE": 9.963467284257428,
+    "MAPE": 510.54098654140915,
+    "model": "RandomForest",
+    "horizon": 30
+  },
+  "Water_Spring_Amiata": {
+    "MAE": 0.034681699696585244,
+    "RMSE": 0.06671323135519731,
+    "MAPE": 9.801298139686452,
+    "model": "RandomForest",
+    "horizon": 30
+  },
+  "Water_Spring_Lupa": {
+    "MAE": 5.0663952702703146,
+    "RMSE": 6.618739630172055,
+    "MAPE": 4.806218907693243,
+    "model": "RandomForest",
+    "horizon": 30
+  },
+  "Water_Spring_Madonna_di_Canneto": {
+    "MAE": 25.720088348669837,
+    "RMSE": 29.553494262570187,
+    "MAPE": 11.409382758538833,
+    "model": "RandomForest",
+    "horizon": 30
+  }
+}
