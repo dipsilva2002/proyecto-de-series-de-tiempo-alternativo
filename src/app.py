@@ -1,231 +1,308 @@
-from __future__ import annotations
-import os, json, argparse, warnings
-from pathlib import Path
-import itertools
+import os
+import argparse
+import json as jsonlib
+import warnings
+from typing import Tuple, Dict, List
+warnings.filterwarnings("ignore")
 
 import numpy as np
 import pandas as pd
+
 import matplotlib.pyplot as plt
+import seaborn as sns
 
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.preprocessing import StandardScaler
+from sklearn.base import BaseEstimator
 
-import statsmodels.api as sm
+try:
+    from xgboost import XGBRegressor
+    _HAS_XGB = True
+except Exception:
+    _HAS_XGB = False
+
 from statsmodels.tsa.statespace.sarimax import SARIMAX
-from statsmodels.tsa.stattools import adfuller
-from statsmodels.tsa.seasonal import seasonal_decompose
 
-warnings.filterwarnings("ignore")
-
-DATA_URL_DEFAULT = "https://raw.githubusercontent.com/4GeeksAcademy/alternative-time-series-project/main/sales.csv"
+from src.utils import Paths, ensure_dirs, get_env_int, get_env_str
 
 
-def ensure_dirs():
-    for d in ["data/raw", "data/interim", "data/processed", "models", "reports/figures"]:
-        os.makedirs(d, exist_ok=True)
+class MeanDummyRegressor(BaseEstimator):
+    def __init__(self, mean_value: float):
+        self.mean_value = float(mean_value)
+
+    def predict(self, X):
+        import numpy as np
+        return np.repeat(self.mean_value, len(X))
 
 
-def load_sales_dataframe(source: str) -> pd.DataFrame:
-    """
-    Carga el CSV desde URL o ruta local. Busca columna de fecha y de ventas,
-    normaliza nombres y asegura frecuencia regular (mensual por defecto si no se infiere).
-    """
-    df = pd.read_csv(source)
-
-
-    df.columns = [c.lower() for c in df.columns]
-    date_candidates = ["date", "ds", "fecha", "time", "month"]
-    value_candidates = ["sales", "y", "valor", "value", "amount"]
-
-    date_col = next((c for c in date_candidates if c in df.columns), None)
-    val_col  = next((c for c in value_candidates if c in df.columns), None)
-    if date_col is None or val_col is None:
-        raise ValueError(f"No encontré columnas de fecha/ventas en: {list(df.columns)}")
-
-    df[date_col] = pd.to_datetime(df[date_col], infer_datetime_format=True, errors="coerce")
-    df = df.dropna(subset=[date_col, val_col]).sort_values(date_col)
-    df = df.set_index(date_col).rename(columns={val_col: "sales"})
-
-    
-    if df.index.inferred_freq is None:
-        df = df.resample("MS").sum()
-    else:
-        df = df.asfreq(df.index.inferred_freq)
-
-    df.to_csv("data/processed/sales_processed.csv")
+def generate_synthetic_multizone(start="2020-01-01", periods=1000, freq="D", seed=42) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    idx = pd.date_range(start=start, periods=periods, freq=freq)
+    zones = ["A", "B", "C"]
+    rows = []
+    for z in zones:
+        baseline = {"A": 120, "B": 200, "C": 80}[z]
+        seasonal = 20 * np.sin(2 * np.pi * np.arange(periods) / 7.0)
+        trend = np.linspace(0, 10, periods)
+        noise = rng.normal(0, 8, periods)
+        volume = baseline + seasonal + trend + noise
+        rows.append(pd.DataFrame({"date": idx, "zone": z, "volume": volume}))
+    df = pd.concat(rows, ignore_index=True)
     return df
 
 
-def plot_series(df: pd.DataFrame, title: str, path: str):
-    plt.figure(figsize=(10,4))
-    plt.plot(df.index, df["sales"])
-    plt.title(title)
-    plt.xlabel("Fecha"); plt.ylabel("Ventas")
-    plt.tight_layout(); plt.savefig(path, dpi=150); plt.close()
-
-def adf_test(series: pd.Series) -> dict:
-    res = adfuller(series.dropna(), autolag="AIC")
-    keys = ["adf_statistic", "p_value", "used_lag", "n_obs", "critical_values", "icbest"]
-    out = dict(zip(keys, [res[0], res[1], res[2], res[3], res[4], res[5]]))
-    return out
-
-def pick_seasonal_period(freq_str: str | None) -> int | None:
-    if not freq_str:
-        return None
-    f = freq_str.upper()
-    if "M" in f:   
-        return 12
-    if "W" in f:   
-        return 52
-    if f == "D":   
-        return 7
-    return None
-
-def plot_decomposition(df: pd.DataFrame, period: int, out_prefix: str):
-    dec = seasonal_decompose(df["sales"], model="additive", period=period, extrapolate_trend="freq")
-    fig = dec.plot()
-    fig.set_size_inches(10,8); fig.tight_layout()
-    plt.savefig(f"{out_prefix}_decompose.png", dpi=150); plt.close()
-    return {
-        "trend_head": dec.trend.dropna().head(3).round(3).tolist(),
-        "seasonal_head": dec.seasonal.dropna().head(3).round(3).tolist(),
-        "resid_head": dec.resid.dropna().head(3).round(3).tolist()
-    }
-
-def train_test_split_series(df: pd.DataFrame, test_periods: int = 12):
-    train = df.iloc[:-test_periods].copy()
-    test  = df.iloc[-test_periods:].copy()
-    return train, test
+def load_or_create_raw(p: Paths, seed: int = 42) -> pd.DataFrame:
+    ensure_dirs(p)
+    raw_csv = os.path.join(p.raw_dir, "water.csv")
+    if os.path.exists(raw_csv):
+        df = pd.read_csv(raw_csv, parse_dates=["date"])
+    else:
+        df = generate_synthetic_multizone(seed=seed)
+        df.to_csv(raw_csv, index=False)
+    df = df.dropna().copy()
+    df["zone"] = df["zone"].astype(str)
+    df = df.sort_values(["zone", "date"])
+    return df
 
 
-def sarimax_grid_search(y_train: pd.Series, seasonal_period: int | None):
-
-    p = d = q = [0,1,2]
-    P = D = Q = [0,1]
-    m = seasonal_period if (seasonal_period and seasonal_period > 1) else 0
-
-    best_aic = np.inf
-    best_cfg = None
-    best_res = None
-
-    for order in itertools.product(p, d, q):
-        if m > 0:
-            for sorder in itertools.product(P, D, Q):
-                try:
-                    res = SARIMAX(
-                        y_train,
-                        order=order,
-                        seasonal_order=(sorder[0], sorder[1], sorder[2], m),
-                        enforce_stationarity=False,
-                        enforce_invertibility=False
-                    ).fit(disp=False)
-                    if res.aic < best_aic:
-                        best_aic, best_cfg, best_res = res.aic, (order, (sorder[0], sorder[1], sorder[2], m)), res
-                except Exception:
-                    continue
-        else:
-            try:
-                res = SARIMAX(
-                    y_train,
-                    order=order,
-                    enforce_stationarity=False,
-                    enforce_invertibility=False
-                ).fit(disp=False)
-                if res.aic < best_aic:
-                    best_aic, best_cfg, best_res = res.aic, (order, None), res
-            except Exception:
-                continue
-
-    if best_res is None:
-        raise RuntimeError("No se pudo ajustar ningún SARIMAX; revisa datos/periodicidad.")
-    return best_res, best_cfg
+def plot_overview(df: pd.DataFrame, p: Paths):
+    fig, ax = plt.subplots(1, 1, figsize=(10, 4))
+    for z, g in df.groupby("zone"):
+        ax.plot(g["date"], g["volume"], label=f"Zone {z}", alpha=0.8)
+    ax.set_title("Volumen de agua por zona (serie temporal)")
+    ax.set_xlabel("Fecha")
+    ax.set_ylabel("Volumen")
+    ax.legend()
+    plt.tight_layout()
+    fig_path = os.path.join(p.reports_dir, "overview.png")
+    plt.savefig(fig_path)
+    plt.close(fig)
 
 
-def metrics_dict(y_true, y_pred):
-    from sklearn.metrics import mean_absolute_error, mean_squared_error
-    mae = mean_absolute_error(y_true, y_pred)
- 
-    try:
-        rmse = mean_squared_error(y_true, y_pred, squared=False)
-    except TypeError:
-        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-    mape = (np.abs((y_true - y_pred) / np.clip(np.abs(y_true), 1e-8, None))).mean() * 100
-    return {"MAE": float(mae), "RMSE": float(rmse), "MAPE": float(mape)}
+def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["dayofweek"] = df["date"].dt.dayofweek
+    df["month"] = df["date"].dt.month
+    df["dayofyear"] = df["date"].dt.dayofyear
+    return df
 
 
-def plot_forecast(train: pd.DataFrame, test: pd.DataFrame, pred: pd.Series, path: str, title: str = "Predicción de Ventas"):
-    plt.figure(figsize=(10,5))
-    plt.plot(train.index, train["sales"], label="Train")
-    plt.plot(test.index, test["sales"], label="Test")
-    plt.plot(pred.index, pred.values, label="Predicción", linestyle="--")
-    plt.title(title); plt.xlabel("Fecha"); plt.ylabel("Ventas"); plt.legend()
-    plt.tight_layout(); plt.savefig(path, dpi=150); plt.close()
+def make_lag_features(df: pd.DataFrame, lags: List[int] = [1, 7, 14]) -> pd.DataFrame:
+    df = df.copy().sort_values(["zone", "date"])
+    for L in lags:
+        df[f"lag_{L}"] = df.groupby("zone")["volume"].shift(L)
+    df["roll7"] = df.groupby("zone")["volume"].rolling(7, min_periods=1).mean().reset_index(0, drop=True)
+    df["roll14"] = df.groupby("zone")["volume"].rolling(14, min_periods=1).mean().reset_index(0, drop=True)
+    return df
+
+
+def prepare_processed(df_raw: pd.DataFrame, p: Paths) -> pd.DataFrame:
+    df = add_time_features(df_raw)
+    df = make_lag_features(df)
+    df = df.dropna().reset_index(drop=True)
+    out_csv = os.path.join(p.processed_dir, "processed.csv")
+    df.to_csv(out_csv, index=False)
+    return df
+
+
+def seasonal_naive_forecast(zone_series: pd.Series, horizon: int, season: int = 7) -> np.ndarray:
+    history = zone_series.values
+    if len(history) < season:
+        return np.repeat(history[-1], horizon)
+    last_season = history[-season:]
+    reps = int(np.ceil(horizon / season))
+    fcst = np.tile(last_season, reps)[:horizon]
+    return fcst
+
+
+def train_sarimax_per_zone(df: pd.DataFrame, order=(1,0,1), seasonal_order=(1,0,1,7)) -> Dict[str, object]:
+    models = {}
+    for z, g in df.groupby("zone"):
+        g = g.sort_values("date")
+        endog = g["volume"].values
+        model = SARIMAX(endog, order=order, seasonal_order=seasonal_order, enforce_stationarity=False, enforce_invertibility=False)
+        fit = model.fit(disp=False)
+        models[z] = fit
+    return models
+
+
+def train_xgb_global(df_proc: pd.DataFrame):
+    df = pd.get_dummies(df_proc.copy(), columns=["zone"], drop_first=False)
+    feature_cols = [c for c in df.columns if c not in ["date", "volume"]]
+    if not _HAS_XGB:
+        print("XGBoost no disponible. Usando MeanDummyRegressor (media global).")
+        dummy = MeanDummyRegressor(mean_value=df["volume"].mean())
+        return dummy, feature_cols
+    X = df[feature_cols]
+    y = df["volume"]
+    model = XGBRegressor(
+        n_estimators=600, max_depth=6, learning_rate=0.05,
+        subsample=0.9, colsample_bytree=0.9, random_state=42, n_jobs=-1
+    )
+    model.fit(X, y)
+    return model, feature_cols
+
+
+def metrics(y_true, y_pred) -> Dict[str, float]:
+    mae = float(mean_absolute_error(y_true, y_pred))
+    mse = float(mean_squared_error(y_true, y_pred))  # sin 'squared=' para compatibilidad
+    rmse = float(np.sqrt(mse))
+    mape = float(np.mean(np.abs((y_true - y_pred) / np.clip(np.abs(y_true), 1e-8, None))) * 100.0)
+    return {"mae": mae, "rmse": rmse, "mape": mape}
+
+
+def evaluate_models(df_raw: pd.DataFrame, df_proc: pd.DataFrame, saris: Dict[str, object], xgb: object, xgb_cols: List[str], horizon: int = 30, p: Paths = Paths()) -> Dict:
+    results = {}
+    for z, g in df_raw.groupby("zone"):
+        g = g.sort_values("date")
+        train = g.iloc[:-horizon]
+        test = g.iloc[-horizon:]
+        sn_pred = seasonal_naive_forecast(train["volume"], horizon=horizon, season=7)
+        sn_metrics = metrics(test["volume"].values, sn_pred)
+        sar = saris[z]
+        sar_pred = sar.forecast(steps=horizon)
+        sar_metrics = metrics(test["volume"].values, sar_pred)
+        g_proc = df_proc[df_proc["zone"] == z].sort_values("date")
+        X_test = g_proc.iloc[-horizon:].copy()
+        X_test = pd.get_dummies(X_test, columns=["zone"], drop_first=False)
+        for c in xgb_cols:
+            if c not in X_test.columns:
+                X_test[c] = 0
+        X_test = X_test[xgb_cols]
+        xgb_pred = xgb.predict(X_test)
+        xgb_metrics = metrics(test["volume"].values, xgb_pred)
+        results[z] = {
+            "seasonal_naive": sn_metrics,
+            "sarimax": sar_metrics,
+            "xgb": xgb_metrics
+        }
+    return results
+
+
+def forecast(df_raw: pd.DataFrame, df_proc: pd.DataFrame, saris: Dict[str, object], xgb: object, xgb_cols: List[str], horizon: int, p: Paths) -> pd.DataFrame:
+    last_date = df_raw["date"].max()
+    future_idx = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=horizon, freq="D")
+    out_rows = []
+    for z in sorted(df_raw["zone"].unique()):
+        g = df_raw[df_raw["zone"] == z].sort_values("date")
+        sn_pred = seasonal_naive_forecast(g["volume"], horizon=horizon, season=7)
+        sar = saris[z]
+        sar_pred = sar.forecast(steps=horizon)
+        g_proc = df_proc[df_proc["zone"] == z].sort_values("date")
+        last = g_proc.iloc[-1:].copy()
+        future_feats = []
+        for dt in future_idx:
+            row = last.copy()
+            row["date"] = dt
+            row["dayofweek"] = dt.dayofweek
+            row["month"] = dt.month
+            row["dayofyear"] = dt.timetuple().tm_yday
+            future_feats.append(row)
+        fut_df = pd.concat(future_feats, ignore_index=True)
+        fut_df = pd.get_dummies(fut_df, columns=["zone"], drop_first=False)
+        for c in xgb_cols:
+            if c not in fut_df.columns:
+                fut_df[c] = 0
+        fut_df = fut_df[xgb_cols]
+        xgb_pred = xgb.predict(fut_df)
+        out_rows.append(pd.DataFrame({
+            "date": future_idx,
+            "zone": z,
+            "pred_seasonal_naive": sn_pred,
+            "pred_sarimax": sar_pred,
+            "pred_xgb": xgb_pred
+        }))
+    fcst = pd.concat(out_rows, ignore_index=True)
+    fcst.to_csv(os.path.join(p.processed_dir, "forecast.csv"), index=False)
+    return fcst
+
+
+def save_models(saris: Dict[str, object], xgb: object, p: Paths):
+    import joblib
+    for z, model in saris.items():
+        joblib.dump(model, os.path.join(p.models_dir, f"sarimax_zone_{z}.joblib"))
+    if isinstance(xgb, MeanDummyRegressor):
+        print("XGB es dummy; no se guarda artefacto xgb_global.joblib.")
+    else:
+        joblib.dump(xgb, os.path.join(p.models_dir, "xgb_global.joblib"))
+
+
+def save_metrics(metrics_dict: Dict, p: Paths):
+    with open(os.path.join(p.models_dir, "metrics.json"), "w") as f:
+        jsonlib.dump(metrics_dict, f, indent=2)
+
+
+def plot_forecast(fcst: pd.DataFrame, df_raw: pd.DataFrame, p: Paths):
+    for z in sorted(df_raw["zone"].unique()):
+        hist = df_raw[df_raw["zone"] == z].sort_values("date")
+        fut = fcst[fcst["zone"] == z].sort_values("date")
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.plot(hist["date"], hist["volume"], label="Histórico")
+        ax.plot(fut["date"], fut["pred_seasonal_naive"], "--", label="SN")
+        ax.plot(fut["date"], fut["pred_sarimax"], "--", label="SARIMAX")
+        ax.plot(fut["date"], fut["pred_xgb"], "--", label="XGB")
+        ax.set_title(f"Zona {z} - Forecast")
+        ax.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(p.reports_dir, f"forecast_zone_{z}.png"))
+        plt.close(fig)
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data-url", default=DATA_URL_DEFAULT, help="URL o ruta local del CSV de ventas")
-    parser.add_argument("--test-periods", type=int, default=12, help="Períodos para test (p.ej., 12 meses)")
-    parser.add_argument("--seasonal-period", type=int, default=-1, help="Forzar período estacional (e.g., 12). -1 = auto")
+    parser = argparse.ArgumentParser(description="Proyecto de Series Temporales: Volumen de agua por zonas")
+    parser.add_argument("--prepare", action="store_true", help="Crea/limpia datos y features")
+    parser.add_argument("--train", action="store_true", help="Entrena modelos")
+    parser.add_argument("--evaluate", action="store_true", help="Evalúa modelos")
+    parser.add_argument("--forecast", action="store_true", help="Genera pronóstico")
+    parser.add_argument("--horizon", type=int, default=None, help="Horizonte de forecast")
+    parser.add_argument("--all", action="store_true", help="Ejecuta prepare+train+evaluate+forecast")
     args = parser.parse_args()
 
-    ensure_dirs()
+    seed = get_env_int("SEED", 42)
+    default_h = get_env_int("FORECAST_HORIZON", 30)
+    horizon = args.horizon if args.horizon is not None else default_h
 
+    p = Paths()
+    ensure_dirs(p)
 
-    print(f"Cargando datos desde: {args.data_url}")
-    df = load_sales_dataframe(args.data_url)
-    print(f"Filas: {len(df)} | índice: {df.index.min().date()} → {df.index.max().date()} | freq: {df.index.inferred_freq}")
+    if args.prepare or args.all:
+        df_raw = load_or_create_raw(p, seed=seed)
+        plot_overview(df_raw, p)
+        df_proc = prepare_processed(df_raw, p)
+        print("PREPARE listo: data/raw/water.csv, data/processed/processed.csv y reports/figures/overview.png")
 
+    if not (args.prepare or args.all):
+        df_raw = pd.read_csv(os.path.join(p.raw_dir, "water.csv"), parse_dates=["date"])
+        df_proc = pd.read_csv(os.path.join(p.processed_dir, "processed.csv"), parse_dates=["date"])
 
-    freq = df.index.inferred_freq
-    tensor = freq if freq is not None else "No inferido (regularizado a mensual MS)"
-    plot_series(df, "Serie de Ventas", "reports/figures/series_ventas.png")
+    if args.train or args.all:
+        saris = train_sarimax_per_zone(df_raw)
+        xgb, xgb_cols = train_xgb_global(df_proc)
+        save_models(saris, xgb, p)
+        with open(os.path.join(p.models_dir, "xgb_columns.json"), "w") as f:
+            jsonlib.dump(xgb_cols, f)
+        print("modelos guardados en /models")
 
-    seasonal_period = args.seasonal_period if args.seasonal_period > 0 else pick_seasonal_period(freq)
-    if seasonal_period is None:
-        seasonal_period = 12  
-    deco_info = plot_decomposition(df, seasonal_period, "reports/figures/series")
+    if not (args.train or args.all):
+        import joblib
+        saris = {}
+        for z in sorted(df_raw["zone"].unique()):
+            saris[z] = joblib.load(os.path.join(p.models_dir, f"sarimax_zone_{z}.joblib"))
+        with open(os.path.join(p.models_dir, "xgb_columns.json")) as f:
+            xgb_cols = jsonlib.load(f)
+        xgb = joblib.load(os.path.join(p.models_dir, "xgb_global.joblib"))
 
-    adf_res = adf_test(df["sales"])
-    analysis = {
-        "tensor_unidad_tiempo": str(tensor),
-        "tendencia_muestra_trend_head": deco_info["trend_head"],
-        "estacionalidad_periodo_usado": int(seasonal_period),
-        "ruido_muestra_resid_head": deco_info["resid_head"],
-        "adf_test": {
-            "adf_statistic": adf_res["adf_statistic"],
-            "p_value": adf_res["p_value"],
-            "critical_values": adf_res["critical_values"]
-        },
-        "nota_estacionaria": "Probablemente NO estacionaria si p_value >= 0.05; SARIMAX maneja diferenciación via d/D."
-    }
-    with open("reports/analysis.json", "w") as f:
-        json.dump(analysis, f, indent=2)
+    if args.evaluate or args.all:
+        res = evaluate_models(df_raw, df_proc, saris, xgb, xgb_cols, horizon=horizon, p=p)
+        save_metrics(res, p)
+        print("EVALUATE listo: métricas en models/metrics.json")
 
+    if args.forecast or args.all:
+        fcst = forecast(df_raw, df_proc, saris, xgb, xgb_cols, horizon=horizon, p=p)
+        plot_forecast(fcst, df_raw, p)
+        print(f"FORECAST listo: forecast.csv y figuras por zona en {p.reports_dir}")
 
-    train_df, test_df = train_test_split_series(df, test_periods=args.test_periods)
-    y_train, y_test = train_df["sales"], test_df["sales"]
-
-   
-    print("Buscando mejor configuración SARIMAX (grid pequeño)...")
-    model_res, model_cfg = sarimax_grid_search(y_train, seasonal_period)
-    print("Mejor configuración:", model_cfg, "| AIC:", round(model_res.aic, 2))
-
-
-    n_test = len(y_test)
-    y_pred = pd.Series(model_res.forecast(steps=n_test), index=y_test.index)
-
-  
-    mets = metrics_dict(y_test.values, y_pred.values)
-    with open("models/metrics.json", "w") as f:
-        json.dump(mets, f, indent=2)
-    print("Métricas:", mets)
-
-    plot_forecast(train_df, test_df, y_pred, "reports/figures/forecast_vs_real.png")
-
- 
-    model_res.save("models/arima.pkl")
-    print("Modelo guardado en models/arima.pkl")
-    print("Listo. Figuras en reports/figures/, métricas en models/metrics.json, análisis en reports/analysis.json.")
 
 if __name__ == "__main__":
     main()
